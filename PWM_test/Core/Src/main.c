@@ -94,6 +94,8 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  __HAL_TIM_SET_AUTORELOAD(&htim2, 1000);
+  __HAL_TIM_SET_COMPARE(&htim2,TIM_CHANNEL_1,1000);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -103,6 +105,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  int x;
+	  for(x=0;x<=4999;x++)  //從最暗到最亮
+	  {
+		  __HAL_TIM_SET_COMPARE(&htim2,TIM_CHANNEL_1,x);
+		  HAL_Delay(5); //方便觀察LED燈明暗變化
+	  }
+	  for(x=4999;x>=0;x--) //從最亮到最暗
+	  {
+		  __HAL_TIM_SET_COMPARE(&htim2,TIM_CHANNEL_1,x);
+		  HAL_Delay(5);
+	  }
   }
   /* USER CODE END 3 */
 }
