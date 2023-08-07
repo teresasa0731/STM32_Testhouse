@@ -1,14 +1,6 @@
-# STM32_Test  
-**locate at E:\STM32\GITHUB_STM32_Test**  
-Develop Nucleo MB1136 C-04 with stm32F446RE, for motor control.  
+# Project for bule botton & CCW/CW motor control
 
-## stm32 project 1: UART_test  
-using PA5 (GREEN LED), TIM2_CH1 for test.  
-![Alt text](image-1.png)
-
-## stm32 project 2: bule botton & CCW/CW motor control
-
-### reference
+## reference
 1. interrupt
 https://wiki.st.com/stm32mcu/wiki/Getting_started_with_EXTI  
     1. .ioc setting![Alt text](image.png)
@@ -24,7 +16,7 @@ https://wiki.st.com/stm32mcu/wiki/Getting_started_with_EXTI
     }
     /* USER CODE END 4 */</code></pre>
 
-2. UART
+2. USART
 <pre><code>/* USER CODE BEGIN PFP */
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 /* USER CODE END PFP */
