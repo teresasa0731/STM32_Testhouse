@@ -29,8 +29,8 @@
 /* USER CODE BEGIN PTD */
 typedef struct _MOTOR
 {
-	uint32_t target;
-	short speed;
+	uint32_t TargetPulse;	// from user input
+	short Speed;	// calculated from encoder
 	uint16_t direc;
 }MOTOR;
 /* USER CODE END PTD */
@@ -41,6 +41,24 @@ typedef struct _MOTOR
 #define kp 0.86
 #define ki 0.012
 #define kd 0.005
+
+#define STOP 0
+#define CW_A 1
+#define CCW_B 2
+
+#define motor1A TIM1 -> CCR1
+#define motor1B TIM14 -> CCR1
+#define encoderM1 TIM2 -> CNT
+
+#define motor2A TIM1 -> CCR2
+#define motor2B TIM3 -> CCR3
+#define encoderM2 TIM3 -> CNT
+
+#define motor3A TIM8 -> CCR2
+#define motor3B TIM12 -> CCR1
+#define encoderM3 TIM5 -> CNT
+
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,109 +67,218 @@ typedef struct _MOTOR
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim14;
 
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
-MOTOR motor1;
+MOTOR motor[4];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_TIM2_Init(void);
-static void MX_USART2_UART_Init(void);
+static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM14_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+uint16_t FSRThreshold = 200;
+uint16_t currentMotor = 0;
+uint16_t encoderRead_flag = 0;
+
+
 uint32_t Target = 0;
 uint16_t direction = 0;
-uint16_t currentMotor = 1;
-short fspeed;
 
 
-uint16_t encoderRead_flag = 0;
+
+
+// ADC usage
+uint16_t FSRValue[6];
+
 
 
 
 void initMotor(void){
 	// motor 1
-	motor1.speed = 0;
-	motor1.target = 0;
-	motor1.direc = 0;
-	TIM14 -> CCR1 = 0;
-	TIM1 -> CCR1 = 0;
+	for(int i = 1;i <= 3; i++){
+		motor[i].Speed = 0;
+		motor[i].TargetPulse = 0;
+		motor[i].direc = 0;
+	}
 
-	HAL_TIM_Encoder_Start(&htim2,TIM_CHANNEL_1 | TIM_CHANNEL_2);	// start encoder1(timer2)
-	HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_1);
-	HAL_TIM_PWM_Start(&htim14,TIM_CHANNEL_1);
+	motor1A = 0;
+	motor1B = 0;
 
+	HAL_TIM_Encoder_Start(&htim2,TIM_CHANNEL_1 | TIM_CHANNEL_2);	// start encoderM1(timer2)
+	HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_1);	// start motor1A
+	HAL_TIM_PWM_Start(&htim14,TIM_CHANNEL_1);	// start motor1B
 }
 
-// table for converting FSR voltage(named as RPM),to PWM pulse value
-uint32_t speed2pulse(int rpm_value){
-	uint32_t pulse_value = rpm_value;
+void errorOccur(uint16_t type,uint16_t motorNum){
+	char uart_buf[100];
+	int uart_buf_len;
+	switch(type){
+	case 1:
+		uart_buf_len = sprintf(uart_buf, "Can't read motor %d encoder value\r\n",motorNum);
+		HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
+	case 2:
+		uart_buf_len = sprintf(uart_buf, "Can't config motor %d speed\r\n",motorNum);
+		HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
+
+	}
+}
+
+
+// table for converting speed read from encoder(rpm),to PWM pulse value
+uint32_t speed2pulse(uint32_t rpm_value){
+	uint32_t pulse_value = 16 * rpm_value + 86;
 	return pulse_value;
 }
 
-void changeSpeed(uint16_t d,MOTOR *motor){
-	uint32_t pulse = speed2pulse(motor->speed);
-	if(motor->direc == d){	// no inverse
-		if(d == 0) TIM14 -> CCR1 = pulse;
-		else if(d == 1) TIM1 -> CCR1 = pulse;
-//		uart_buf_len = sprintf(uart_buf, "change motor TIM pulse to %d \r\n",pulse);
-//		HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
-	}else if(motor->direc != d){
-		TIM14 -> CCR1 = 0;
-		TIM1 -> CCR1 = 0;
-		HAL_Delay(10);
-		if(d == 0) TIM14 -> CCR1 = pulse;
-		else if(d == 1) TIM1 -> CCR1 = pulse;
-//		uart_buf_len = sprintf(uart_buf, "change motor TIM pulse to %d,direc %d \r\n",pulse,d);
-//		HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
-	}else{
-		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-	}
-	motor->direc = d;
+// table for converting ADC voltage read from FSR,to PWM pulse value
+uint32_t voltage2pulse(uint32_t FSRvoltage){
+	uint32_t pulse_value = FSRvoltage/10 + 100;	// input speed = 0.1*FSR_value + 100
+	return pulse_value;
 }
 
-// get motor real speed named as encoder value
+
+
+// get motor real speed (named as encoder value)
 short getSpeed(uint16_t motor_num){
+	short fspeed = 0;
 	switch(motor_num){
 	case 1:
-		fspeed = (short)((TIM2 -> CNT)*200/(4*16))*10;	// SPEED = ((TIM_counter)/(CPR*F))/t
-		TIM2 -> CNT = 0;
+		fspeed = (short)(encoderM1)*100/(16*4); // v = (Num/(CPR*F))/t
+		encoderM1 = 0;
 		return fspeed;
 	default:
-		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+		errorOccur(1,motor_num);
+	}
+	return 0;
+}
+
+// ADC Conversion processing
+void readFSRVoltage(void){
+	for(int FSRNum = 0; FSRNum < 6; FSRNum ++){
+       HAL_ADC_Start(&hadc1);
+       HAL_ADC_PollForConversion(&hadc1,100);
+       if(HAL_IS_BIT_SET(HAL_ADC_GetState(&hadc1),HAL_ADC_STATE_REG_EOC)){
+    	   FSRValue[FSRNum] = (uint16_t)HAL_ADC_GetValue(&hadc1);
+       }
+	}
+}
+void changeSpeed_M1(void){
+	switch(motor[1].direc){
+		case STOP:	// STOP
+			motor1A = 0;
+			motor1B = 0;
+		case CW_A:
+			if(motor[1].direc == CCW_B){	//inverse
+				motor1A = 0;
+				motor1B = 0;
+				HAL_Delay(10);	// dead time
+			}
+			motor1A = motor[1].TargetPulse;
+		case CCW_B:
+			if(motor[1].direc == CW_A){	//inverse
+				motor1A = 0;
+				motor1B = 0;
+				HAL_Delay(10);	// dead time
+			}
+			motor1B = motor[1].TargetPulse;
+		default:
+			errorOccur(2,1);
 	}
 }
 
-short PID_Cal(short fspeed,short *error)
-{
-	short Error = motor1.target - fspeed;
-	static short Error_last = 0,Error_prev = 0;
-	short pwm_add=0;
-	*error = Error;
-	pwm_add = kp*(Error - Error_last);
-//	pwm_add = kp*(Error - Error_last) + ki*Error + kd*(Error-2.0f*Error_last+Error_prev);
-
-	Error_prev = Error_last;
-	Error_last = Error;
-
-	return pwm_add;
+void changeSpeed_M2(void){
+	switch(motor[2].direc){
+		case STOP:	// STOP
+			motor2A = 0;
+			motor2B = 0;
+		case CW_A:
+			if(motor[2].direc == CCW_B){	//inverse
+				motor2A = 0;
+				motor2B = 0;
+				HAL_Delay(10);	// dead time
+			}
+			motor2A = motor[1].TargetPulse;
+		case CCW_B:
+			if(motor[2].direc == CW_A){	//inverse
+				motor2A = 0;
+				motor2B = 0;
+				HAL_Delay(10);	// dead time
+			}
+			motor2B = motor[2].TargetPulse;
+		default:
+			errorOccur(2,2);
+	}
 }
 
+void changeSpeed_M3(void){
+	switch(motor[3].direc){
+		case STOP:	// STOP
+			motor3A = 0;
+			motor3B = 0;
+		case CW_A:
+			if(motor[3].direc == CCW_B){	//inverse
+				motor3A = 0;
+				motor3B = 0;
+				HAL_Delay(10);	// dead time
+			}
+			motor3A = motor[3].TargetPulse;
+		case CCW_B:
+			if(motor[1].direc == CW_A){	//inverse
+				motor3A = 0;
+				motor3B = 0;
+				HAL_Delay(10);	// dead time
+			}
+			motor3B = motor[3].TargetPulse;
+		default:
+			errorOccur(2,3);
+	}
+}
+
+void changeSpeed(uint16_t motorNum){
+	if(motorNum == 1) changeSpeed_M1();
+	else if(motorNum == 2) changeSpeed_M2();
+	else if(motorNum == 3) changeSpeed_M3();
+}
+
+
+
+//short PID_Cal(short fspeed,short *error)
+//{
+//	short Error = motor[1].TargetPulse - fspeed;
+//	static short Error_last = 0,Error_prev = 0;
+//	short pwm_add=0;
+//	*error = Error;
+//	pwm_add = kp*(Error - Error_last);
+////	pwm_add = kp*(Error - Error_last) + ki*Error + kd*(Error-2.0f*Error_last+Error_prev);
+//
+//	Error_prev = Error_last;
+//	Error_last = Error;
+//
+//	return pwm_add;
+//}
+/* USER CODE END 0 */
 
 /**
   * @brief  The application entry point.
@@ -160,8 +287,8 @@ short PID_Cal(short fspeed,short *error)
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-  char uart_buf[100];
-  int uart_buf_len;
+	char uart_buf[100];
+	int uart_buf_len;
 
   /* USER CODE END 1 */
 
@@ -183,17 +310,22 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_TIM2_Init();
-  MX_USART2_UART_Init();
+  MX_DMA_Init();
   MX_TIM1_Init();
   MX_TIM6_Init();
   MX_TIM14_Init();
+  MX_TIM2_Init();
+  MX_USART2_UART_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
+  uart_buf_len = sprintf(uart_buf, "Configuring...\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
   initMotor();
   // Start timer
   HAL_TIM_Base_Start_IT(&htim6);
-  uart_buf_len = sprintf(uart_buf, "Motor combination Test\r\n");
+  uart_buf_len = sprintf(uart_buf, "Test Start!\r\n");
   HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
+
 
   /* USER CODE END 2 */
 
@@ -201,14 +333,47 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+
 	  if(encoderRead_flag){
-		  uart_buf_len = sprintf(uart_buf, "current speed (from encoder) = %d \r\n",fspeed);
+		  uart_buf_len = sprintf(uart_buf, "encoder read value %d \r\n",motor[currentMotor].Speed);
 		  HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
-		  HAL_Delay(50);
-		  uart_buf_len = sprintf(uart_buf, "target speed (from button setting) = %d \r\n",motor1.target);
+		  uart_buf_len = sprintf(uart_buf, "pulse (from button setting) = %lu /1000, direc %d \r\n",motor[1].TargetPulse,motor[currentMotor].direc);
 		  HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
 		  encoderRead_flag = 0;
 	  }
+	  readFSRVoltage();
+
+	  if(currentMotor == 0)	// Stationary state
+	  {
+		  for(int i = 0; i < 6; i++){
+			  if(FSRValue[i] >= FSRThreshold){
+				  currentMotor = (i + 2) / 2; // 0&1 for motor1, 2&3 for motor2, 4&5 for motor3
+				  motor[currentMotor].direc = (i%2)? 1 : 2;	// mod=1(1,3,5) for CW(direc code is 1); mod=0(0,2,4) for CCW(direc code is 2)
+				  break;
+			  }
+		  }
+	  }
+	  if(currentMotor != 0) // motor{currentMotor} functioning
+	  {
+		  int idx = (currentMotor-1)*2 + motor[currentMotor].direc % 2;
+		  if(FSRValue[idx] >= FSRThreshold)
+		  {
+			  motor[currentMotor].TargetPulse = voltage2pulse(FSRValue[idx]);
+			  changeSpeed(currentMotor);
+		  }else{
+			  motor[currentMotor].TargetPulse = 0;
+			  motor[currentMotor].direc = 0;
+			  changeSpeed(currentMotor);
+			  currentMotor = 0;
+		  }
+
+	  }
+	  for(int FSRNum = 0; FSRNum < 6; FSRNum ++){
+		  uart_buf_len = sprintf(uart_buf, "idx[%d] value[%d]\r\n",FSRNum,FSRValue[FSRNum]);
+		  HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, uart_buf_len, 100);
+	  }
+	  HAL_Delay(1000);
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -258,6 +423,104 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = ENABLE;
+  hadc1.Init.NbrOfDiscConversion = 1;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 6;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_15;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_9;
+  sConfig.Rank = 2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_14;
+  sConfig.Rank = 3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = 4;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_13;
+  sConfig.Rank = 5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_12;
+  sConfig.Rank = 6;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
@@ -282,7 +545,7 @@ static void MX_TIM1_Init(void)
   htim1.Init.Period = 1000-1;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
   {
     Error_Handler();
@@ -346,7 +609,7 @@ static void MX_TIM2_Init(void)
   htim2.Init.Period = 4294967295;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
   sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
@@ -391,8 +654,8 @@ static void MX_TIM6_Init(void)
   htim6.Instance = TIM6;
   htim6.Init.Prescaler = 160-1;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 5000-1;
-  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  htim6.Init.Period = 1000-1;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
     Error_Handler();
@@ -431,7 +694,7 @@ static void MX_TIM14_Init(void)
   htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim14.Init.Period = 1000-1;
   htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
   {
     Error_Handler();
@@ -489,6 +752,25 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+  /* DMA1_Stream6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -505,20 +787,20 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD2_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin;
+  /*Configure GPIO pin : LED_Pin */
+  GPIO_InitStruct.Pin = LED_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(LED_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
@@ -531,11 +813,10 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if(GPIO_Pin == B1_Pin) {
-//	HAL_GPIO_TogglePin(GPIOA, LD2_Pin);
+  if(GPIO_Pin == B1_Pin) {	// blue button interrupt
 	Target = (Target >= 500)?0:(Target+20);
-	motor1.target = Target;
-//	__HAL_TIM_SET_COMPARE(&htim1,TIM_CHANNEL_1,Target);
+	motor[1].TargetPulse = Target;
+	motor1A = motor[1].TargetPulse; //change pwm pulse value __HAL_TIM_SET_COMPARE(&htim1,TIM_CHANNEL_1,Target);
   } else {
       __NOP();
   }
@@ -543,55 +824,25 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-	short fspeed;
-	short ERROR;
+	short fspeed = 0;
 	static uint8_t i = 0;
-	  if (htim == &htim6)
-	  {
-	    fspeed = getSpeed(currentMotor);
-	    motor1.speed += PID_Cal(fspeed,&ERROR);
-		changeSpeed(0,&motor1);
+	if (htim == &htim6)	// basic clock, 100Hz(10ms)
+	{
+		// motor 1 encoder value
+		fspeed = (short)getSpeed(currentMotor);	// get motor 1 current speed from motor1's encoder
+//		fspeed = PID_Cal(fspeed,&ERROR);	// PID configure new speed for motor 1
+//		SetMotorVoltageAndDirection(speed);
 
 		i++;
-		if(i >= 100)	// every 5msec *100=0.5 sec
+		if(i >= 100)	// every 10 msec *100=1 sec
 		{
 			i = 0;
-			HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+			motor[1].Speed = fspeed;
 			encoderRead_flag = 1;
 		}
-
-	  }
-
-
-//	if(htim->Instance == TIM6)
-//	{
-//		HAL_GPIO_TogglePin(GPIOA, LD2_Pin);
-//		getSpeed(currentMotor);
-//		encoderRead_flag = 1;
-////		speed += PID_Cal(fSpeed,&ERROR);//当�?�PWM?��?��?��?��?��?��?�PID计�?��?�???
-////
-////		//??�制PWM??大�?�围
-////		if(speed>100)speed = 100;
-////		else if(speed<1)speed = 1;
-////
-////		//将PID计�?��?��?�PWM??�入系�??
-////		SetMotorVoltageAndDirection(speed);
-////
-////		/* 每�?��??5*100）ms??�印�???次�?�度?��?�� */
-////		i++;
-////		if(i >= 100)
-////		{
-////			i = 0;
-////			Led_Toggle();
-////			printf("?�度?��?���???%d\n",fSpeed);
-////			printf("?��??��?�度�???%d\n",target);
-////			printf("误差�???%d\n",ERROR);
-////		}
-//	}
-
-	if(htim->Instance == TIM3)
-	{
-
+	}
+	if(htim == &htim2){
+		// motor1 encoder counting
 	}
 }
 /* USER CODE END 4 */
